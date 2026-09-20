@@ -18,25 +18,53 @@ class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+def extract_hostname(raw_url):
+    """Extract clean lowercased hostname without www. prefix."""
+    if not raw_url:
+        return ""
+    try:
+        host = urlparse(raw_url).hostname or ""
+        host = host.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return host
+    except Exception:
+        return ""
+
+
 class Browser:
-    def __init__(self, url, activate=False, keep_open=False, reuse_tab=True):
+    def __init__(
+        self,
+        url,
+        activate=False,
+        keep_open=False,
+        reuse_tab=True,
+        target_id=None,
+        navigate_on_attach=True,
+    ):
         ensure_daemon()
         self.keep_open = keep_open
         self.target = None
+        self.owns_target = True
 
         matched_existing = False
-        if reuse_tab:
+        if target_id:
+            self.target = target_id
+            matched_existing = True
+            self.owns_target = False
+        elif reuse_tab:
             try:
                 targets = cdp("Target.getTargets").get("targetInfos", [])
                 page_targets = [t for t in targets if t.get("type") == "page"]
-                domain = urlparse(url).netloc.lower()
-                if domain.startswith("www."):
-                    domain = domain[4:]
+                domain = extract_hostname(url) if url else ""
                 if domain:
-                    matched = next((t for t in page_targets if domain in t.get("url", "").lower()), None)
-                    if matched:
-                        self.target = matched["targetId"]
-                        matched_existing = True
+                    for t in page_targets:
+                        thost = extract_hostname(t.get("url", ""))
+                        if thost and (thost == domain or thost.endswith("." + domain)):
+                            self.target = t["targetId"]
+                            matched_existing = True
+                            self.owns_target = False
+                            break
                 if not self.target:
                     empty_tab = next(
                         (t for t in page_targets if t.get("url") in ("about:blank", "chrome://newtab/")),
@@ -44,11 +72,13 @@ class Browser:
                     )
                     if empty_tab:
                         self.target = empty_tab["targetId"]
+                        self.owns_target = False
             except Exception:
                 pass
 
         if not self.target:
             self.target = cdp("Target.createTarget", url="about:blank", background=not activate)["targetId"]
+            self.owns_target = True
 
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
         if activate:
@@ -60,11 +90,13 @@ class Browser:
         if url:
             if not matched_existing:
                 self.navigate(url)
-            else:
+            elif navigate_on_attach:
                 curr = self.get_current_info()
                 curr_url = curr.get("url", "") if curr else ""
                 parsed = urlparse(url)
-                if parsed.path not in ("", "/") or domain not in curr_url.lower():
+                curr_host = extract_hostname(curr_url)
+                domain = extract_hostname(url)
+                if parsed.path not in ("", "/") or domain != curr_host:
                     self.navigate(url)
 
     def activate_tab(self):
@@ -78,8 +110,11 @@ class Browser:
         self.call("Page.navigate", url=url)
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            if self.evaluate("document.readyState") == "complete":
-                break
+            try:
+                if self.evaluate("document.readyState") == "complete":
+                    break
+            except Exception:
+                pass
             time.sleep(0.02)
 
     def get_current_info(self):
@@ -166,11 +201,18 @@ class Browser:
         return result
 
     def close(self):
-        if self.target and not self.keep_open:
+        if getattr(self, "session", None):
             try:
-                cdp("Target.closeTarget", targetId=self.target)
+                cdp("Target.detachFromTarget", sessionId=self.session)
             except Exception:
                 pass
+            self.session = None
+        if self.target:
+            if getattr(self, "owns_target", True) and not self.keep_open:
+                try:
+                    cdp("Target.closeTarget", targetId=self.target)
+                except Exception:
+                    pass
             self.target = None
 
 

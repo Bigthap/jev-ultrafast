@@ -1,13 +1,13 @@
 """Global Hotkey Listener for Jev Ultrafast Desktop Voice Assistant."""
 
 import argparse
-import threading
 import time
 
 from pynput import keyboard
 
 from .demo import load_environment
-from .voice import AudioRecorder, execute_voice_goal, transcribe_audio
+from .voice import transcribe_audio
+from .voice_controller import ControllerState, VoiceController
 
 DEFAULT_HOTKEY = "<ctrl>+<shift>+<space>"
 
@@ -16,104 +16,73 @@ class VoiceAssistant:
     def __init__(self, hotkey=DEFAULT_HOTKEY, language=None):
         self.hotkey = hotkey
         self.language = language
-        self.recorder = AudioRecorder()
-        self.is_recording = False
-        self.is_busy = False
-        self.lock = threading.Lock()
-        self._stop_event = threading.Event()
+        self.controller = VoiceController()
+        self.controller.add_state_listener(self._on_state_change)
+        self.controller.add_step_listener(self._on_step)
+        self.recorder = self.controller.recorder
 
     def on_hotkey_pressed(self):
         """Called whenever the global hotkey is pressed."""
-        with self.lock:
-            if self.is_busy:
+        if self.controller.state == ControllerState.RECORDING:
+            print("\n⏹️  [FINISHING] Stopping recording and processing...", flush=True)
+            self.controller.finish_recording()
+        else:
+            started = self.controller.start_recording()
+            if not started:
                 print("\n⚠️  [BUSY] Still executing previous task. Please wait...", flush=True)
-                return
 
-            if not self.is_recording:
-                # Start recording
-                self.is_recording = True
-                threading.Thread(target=self._record_and_process, daemon=True).start()
-            else:
-                # User pressed hotkey to manually stop
-                self.is_recording = False
-                self._stop_event.set()
-
-    def _record_and_process(self):
-        self._stop_event.clear()
-        print("\n" + "=" * 60, flush=True)
-        print("🎙️  [LISTENING] Speak your command now...", flush=True)
-        print("    (Will auto-stop after 1.5s silence, or press hotkey again)", flush=True)
-        print("=" * 60, flush=True)
-
-        # Record with VAD
-        audio = self.recorder.record_with_vad(max_seconds=12.0, silence_timeout=1.6)
-        self.is_recording = False
-
-        if len(audio) == 0:
-            print("❌  [AUDIO] No audio captured. Please try speaking again.", flush=True)
-            return
-
-        with self.lock:
-            self.is_busy = True
-
-        try:
+    def _on_state_change(self, state: ControllerState, details=None):
+        details = details or {}
+        if state == ControllerState.RECORDING:
+            print("\n" + "=" * 60, flush=True)
+            print("🎙️  [LISTENING] Speak your command now...", flush=True)
+            print(f"    (Press [{self.hotkey}] again to finish recording)", flush=True)
+            print("=" * 60, flush=True)
+        elif state == ControllerState.TRANSCRIBING:
             print("\n🧠  [TRANSCRIBING] Converting speech to text...", flush=True)
-            t0 = time.perf_counter()
-            transcript = transcribe_audio(audio, language=self.language)
-            stt_ms = round((time.perf_counter() - t0) * 1000)
-
-            if not transcript:
-                print("❌  [STT] Could not understand speech. Please speak clearly into the mic.", flush=True)
-                return
-
-            print(f"🗣️   User said ({stt_ms}ms): \"{transcript}\"", flush=True)
-
-            def on_intent(intent, current_url, current_title):
-                atype = intent.get("action_type", "navigate").upper()
-                url = intent.get("url")
-                goal = intent.get("goal", transcript)
-                if atype == "IN_PAGE":
-                    print(f"⚡  Mode: [IN-PAGE ACTION] on {current_url or 'current tab'}", flush=True)
-                else:
-                    print(f"🌐  Mode: [NAVIGATE] Target URL: {url}", flush=True)
-                print(f"🎯  Agent Goal: {goal}", flush=True)
-                print("\n🚀  [EXECUTING] Launching Jev Ultrafast on Chrome...", flush=True)
-
-            def on_step(step, state):
-                action = step.get("action", "")
-                kind = step.get("kind", "")
-                prob = step.get("probability", 0.0)
-                conf = step.get("confidence", 0.0)
-                text = step.get("text")
-                text_info = f" -> \"{text}\"" if text else ""
-                print(f"  ⚡ [{kind.upper()}] {action}{text_info} (p={prob:.2f}, conf={conf:.2f})", flush=True)
-
-            t2 = time.perf_counter()
-            snapshot = execute_voice_goal(transcript, on_intent=on_intent, on_step=on_step)
-            exec_sec = round(time.perf_counter() - t2, 1)
-
-            status = snapshot.get("status", "unknown").upper()
-            total_steps = len(snapshot.get("history", []))
-            print("\n" + "-" * 60, flush=True)
-            print(f"✅  [FINISHED] Status: {status} | Steps: {total_steps} | Execution: {exec_sec}s", flush=True)
-            print("-" * 60 + "\n", flush=True)
-
-        except RuntimeError as e:
-            msg = str(e)
-            if "remote-debugging" in msg or "DevToolsActivePort" in msg or "didn't come up" in msg:
-                print("\n⚠️  [CHROME NOT CONNECTED]", flush=True)
-                print("   Please enable Remote Debugging in Google Chrome:")
-                print("   1. Open Chrome and navigate to: chrome://inspect/#remote-debugging")
-                print("   2. Check 'Allow remote debugging for this browser instance'")
-                print("   3. Click 'Allow' on Chrome's popup prompt\n", flush=True)
+        elif state == ControllerState.RESOLVING_INTENT:
+            transcript = details.get("transcript")
+            stt_ms = details.get("stt_ms")
+            ms_info = f" ({stt_ms}ms)" if stt_ms else ""
+            if transcript:
+                print(f"🗣️   User said{ms_info}: \"{transcript}\"", flush=True)
+        elif state == ControllerState.EXECUTING:
+            intent = details.get("intent", {})
+            atype = intent.get("action_type", "navigate").upper()
+            url = intent.get("url")
+            goal = intent.get("goal", "")
+            curr_url = details.get("current_url")
+            if atype == "IN_PAGE":
+                print(f"⚡  Mode: [IN-PAGE ACTION] on {curr_url or 'current tab'}", flush=True)
             else:
-                print(f"\n❌  [ERROR] {e}", flush=True)
-        except Exception as e:
-            print(f"\n❌  [UNEXPECTED ERROR] {e}", flush=True)
-        finally:
-            with self.lock:
-                self.is_busy = False
+                print(f"🌐  Mode: [NAVIGATE] Target URL: {url}", flush=True)
+            print(f"🎯  Agent Goal: {goal}", flush=True)
+            print("\n🚀  [EXECUTING] Launching Jev Ultrafast on Chrome...", flush=True)
+        elif state in (
+            ControllerState.SUCCEEDED,
+            ControllerState.UNVERIFIED,
+            ControllerState.BUDGET_EXCEEDED,
+            ControllerState.BLOCKED,
+            ControllerState.CANCELLED,
+            ControllerState.ERROR,
+        ):
+            res = details.get("result", {})
+            history = res.get("history", [])
+            steps = len(history)
+            status_text = state.value.upper()
+            print("\n" + "-" * 60, flush=True)
+            print(f"✅  [COMPLETED] Status: {status_text} | Steps: {steps}", flush=True)
+            print("-" * 60 + "\n", flush=True)
             print(f"🎙️  Ready for next command! Press [{self.hotkey}] to speak.\n", flush=True)
+
+    def _on_step(self, step, state):
+        action = step.get("action", "")
+        kind = step.get("kind", "")
+        prob = step.get("probability", 0.0)
+        conf = step.get("confidence", 0.0)
+        text = step.get("text")
+        text_info = f" -> \"{text}\"" if text else ""
+        print(f"  ⚡ [{kind.upper()}] {action}{text_info} (p={prob:.2f}, conf={conf:.2f})", flush=True)
 
     def test_microphone(self):
         """Quick 3-second recording test to check microphone levels."""
@@ -137,7 +106,17 @@ class VoiceAssistant:
 
     def run_direct(self):
         """Run a single voice command directly from terminal without hotkey."""
-        self._record_and_process()
+        self.controller.start_recording()
+        while self.controller.state not in (
+            ControllerState.IDLE,
+            ControllerState.SUCCEEDED,
+            ControllerState.UNVERIFIED,
+            ControllerState.BUDGET_EXCEEDED,
+            ControllerState.BLOCKED,
+            ControllerState.CANCELLED,
+            ControllerState.ERROR,
+        ):
+            time.sleep(0.1)
 
     def listen_forever(self):
         """Listen for global hotkey and process commands."""

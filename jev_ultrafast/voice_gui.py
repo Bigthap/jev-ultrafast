@@ -1,30 +1,27 @@
 """Floating Always-on-Top Desktop Voice Assistant GUI for Jev Ultrafast."""
 
-import threading
-import time
 import tkinter as tk
 from tkinter import ttk
 
 from .demo import load_environment
-from .voice import SESSION, AudioRecorder, transcribe_audio
+from .voice_controller import ControllerState, VoiceController
 
 
 class VoiceApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Jev Ultrafast ⚡ Voice Assistant")
-        self.root.geometry("450x520")
-        self.root.minsize(380, 420)
+        self.root.geometry("450x550")
+        self.root.minsize(380, 450)
         self.root.attributes("-topmost", True)
         self.root.configure(bg="#18181b")
 
-        self.session = SESSION
-        self.recorder = AudioRecorder()
-        self.is_recording = False
-        self.is_busy = False
-        self._stop_event = threading.Event()
+        self.controller = VoiceController()
+        self.controller.add_state_listener(self._on_controller_state)
+        self.controller.add_step_listener(self._on_step)
 
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self):
         # Header Frame
@@ -53,22 +50,41 @@ class VoiceApp:
         content = tk.Frame(self.root, bg="#18181b")
         content.pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
 
-        # Big Mic Button
+        # Action Buttons Frame (Mic + Cancel)
+        btn_frame = tk.Frame(content, bg="#18181b")
+        btn_frame.pack(fill=tk.X, pady=(0, 10))
+
         self.mic_btn = tk.Button(
-            content,
+            btn_frame,
             text="🎙️  Click to Speak (กดเพื่อพูด)",
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", 11, "bold"),
             bg="#10b981",
             fg="#ffffff",
             activebackground="#059669",
             activeforeground="#ffffff",
             relief=tk.FLAT,
             cursor="hand2",
-            padx=16,
-            pady=12,
-            command=self.toggle_mic,
+            padx=12,
+            pady=10,
+            command=self.on_mic_click,
         )
-        self.mic_btn.pack(fill=tk.X, pady=(0, 10))
+        self.mic_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        self.cancel_btn = tk.Button(
+            btn_frame,
+            text="❌ Cancel",
+            font=("Segoe UI", 10, "bold"),
+            bg="#3f3f46",
+            fg="#d4d4d8",
+            activebackground="#ef4444",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            cursor="hand2",
+            padx=12,
+            pady=10,
+            command=self.on_cancel_click,
+        )
+        self.cancel_btn.pack(side=tk.RIGHT)
 
         # Status Pill
         status_frame = tk.Frame(content, bg="#18181b")
@@ -215,125 +231,133 @@ class VoiceApp:
         self.log_list.insert(tk.END, message)
         self.log_list.see(tk.END)
 
-    def toggle_mic(self):
-        if self.is_busy:
-            return
-
-        if not self.is_recording:
-            # Start recording
-            self.is_recording = True
-            self.mic_btn.config(
-                text="⏹️  Recording... (Click to Finish)",
-                bg="#ef4444",
-                activebackground="#dc2626",
-            )
-            self.set_status("Listening... Speak now", "#ef4444")
-            self._stop_event.clear()
-            threading.Thread(target=self._record_worker, daemon=True).start()
+    def on_mic_click(self):
+        if self.controller.state == ControllerState.RECORDING:
+            self.controller.finish_recording()
         else:
-            # Stop recording
-            self.is_recording = False
-            self.mic_btn.config(
-                text="🧠  Processing...",
-                bg="#f59e0b",
-                activebackground="#d97706",
-            )
-            self.set_status("Stopping and processing speech...", "#f59e0b")
-            self._stop_event.set()
+            started = self.controller.start_recording()
+            if not started:
+                self.set_status("Controller is busy. Please wait.", "#f59e0b")
 
-    def _record_worker(self):
-        audio = self.recorder.record_with_vad(max_seconds=12.0, silence_timeout=1.6)
-
-        def on_done():
-            self.mic_btn.config(
-                text="🎙️  Click to Speak (กดเพื่อพูด)",
-                bg="#10b981",
-                activebackground="#059669",
-            )
-            self.is_recording = False
-
-        self.root.after(0, on_done)
-
-        if len(audio) == 0:
-            self.root.after(0, lambda: self.set_status("No audio captured. Try again.", "#ef4444"))
-            return
-
-        self.root.after(0, lambda: self.set_status("Transcribing speech...", "#f59e0b"))
-        t0 = time.perf_counter()
-        transcript = transcribe_audio(audio)
-        stt_ms = round((time.perf_counter() - t0) * 1000)
-
-        if not transcript:
-            self.root.after(0, lambda: self.set_status("Could not recognize speech.", "#ef4444"))
-            self.root.after(0, lambda: self.set_speech("(No speech recognized)"))
-            return
-
-        self.root.after(0, lambda: self.set_speech(f"{transcript} ({stt_ms}ms)"))
-        self._process_command(transcript)
+    def on_cancel_click(self):
+        cancelled = self.controller.cancel_task()
+        if cancelled:
+            self.add_log("🛑 Task cancelled by user.")
 
     def send_text_goal(self):
         text = self.entry.get().strip()
-        if not text or self.is_busy:
+        if not text:
+            return
+        if self.controller.state not in (
+            ControllerState.IDLE,
+            ControllerState.SUCCEEDED,
+            ControllerState.UNVERIFIED,
+            ControllerState.BLOCKED,
+            ControllerState.BUDGET_EXCEEDED,
+            ControllerState.CANCELLED,
+            ControllerState.ERROR,
+        ):
+            self.set_status("System is busy with another task.", "#f59e0b")
             return
         self.entry.delete(0, tk.END)
         self.set_speech(f"(Typed): {text}")
-        threading.Thread(target=self._process_command, args=(text,), daemon=True).start()
+        self.controller.submit_text(text)
 
-    def _process_command(self, user_text):
-        self.is_busy = True
-        self.root.after(0, lambda: self.set_status("Analyzing intent & active tab...", "#8b5cf6"))
+    def _on_controller_state(self, state: ControllerState, details=None):
+        def update():
+            details_dict = details or {}
+            if state == ControllerState.RECORDING:
+                self.mic_btn.config(
+                    text="⏹️  Finish Recording (เสร็จสิ้น)",
+                    bg="#ef4444",
+                    activebackground="#dc2626",
+                    state=tk.NORMAL,
+                )
+                self.cancel_btn.config(bg="#ef4444", fg="#ffffff")
+                self.set_status("Listening... Click Finish or speak", "#ef4444")
+            elif state == ControllerState.TRANSCRIBING:
+                self.mic_btn.config(
+                    text="🧠  Transcribing...",
+                    bg="#f59e0b",
+                    activebackground="#d97706",
+                    state=tk.DISABLED,
+                )
+                self.set_status("Transcribing speech with Meta Muse...", "#f59e0b")
+            elif state == ControllerState.RESOLVING_INTENT:
+                transcript = details_dict.get("transcript")
+                stt_ms = details_dict.get("stt_ms")
+                if transcript:
+                    ms_info = f" ({stt_ms}ms)" if stt_ms else ""
+                    self.set_speech(f"{transcript}{ms_info}")
+                self.set_status("Analyzing intent & active tab...", "#8b5cf6")
+            elif state == ControllerState.EXECUTING:
+                intent = details_dict.get("intent", {})
+                atype = intent.get("action_type", "navigate")
+                url = intent.get("url")
+                goal = intent.get("goal", "")
+                curr_url = details_dict.get("current_url")
+                badge = "[⚡ IN-PAGE]" if atype == "in_page" else "[🌐 NAVIGATE]"
+                tab_desc = f"Active Tab: {curr_url or 'Current Page'}" if atype == "in_page" else f"URL: {url}"
+                self.set_goal(f"{badge} {tab_desc}\nGoal: {goal}")
+                self.set_status(f"{badge} Executing on Chrome...", "#3b82f6")
+                self.add_log(f"🎯 {badge} {goal}")
+            elif state == ControllerState.SUCCEEDED:
+                res = details_dict.get("result", {})
+                steps = len(res.get("history", []))
+                self.add_log(f"✅ Succeeded (Verified, {steps} steps)")
+                self.set_status("Completed (Verified)! Click mic to speak", "#10b981")
+                self._reset_buttons()
+            elif state == ControllerState.UNVERIFIED:
+                res = details_dict.get("result", {})
+                steps = len(res.get("history", []))
+                self.add_log(f"⚠️ Done (Unverified postcondition, {steps} steps)")
+                self.set_status("Done (Unverified) — Click mic to speak", "#f59e0b")
+                self._reset_buttons()
+            elif state == ControllerState.BUDGET_EXCEEDED:
+                res = details_dict.get("result", {})
+                steps = len(res.get("history", []))
+                self.add_log(f"⏳ Stopped: Budget exceeded ({steps} steps)")
+                self.set_status("Stopped (Step budget reached)", "#f59e0b")
+                self._reset_buttons()
+            elif state == ControllerState.BLOCKED:
+                self.add_log("🚫 Blocked: No actionable elements")
+                self.set_status("Agent blocked — Try another command", "#ef4444")
+                self._reset_buttons()
+            elif state == ControllerState.CANCELLED:
+                self.add_log("🛑 Turn cancelled.")
+                self.set_status("Cancelled — Ready", "#a1a1aa")
+                self._reset_buttons()
+            elif state == ControllerState.ERROR:
+                err = details_dict.get("error", "Unknown error")
+                self.add_log(f"❌ Error: {err}")
+                self.set_status(f"Error: {err[:35]}", "#ef4444")
+                self._reset_buttons()
 
-        try:
-            def on_intent(intent, current_url, current_title):
-                action_type = intent.get("action_type", "navigate")
-                target_url = intent.get("url")
-                goal = intent.get("goal", user_text)
+        self.root.after(0, update)
 
-                if action_type == "in_page":
-                    badge = "[⚡ IN-PAGE]"
-                    page_desc = f"Active Tab: {current_url or 'Current Page'}"
-                else:
-                    badge = "[🌐 NAVIGATE]"
-                    page_desc = f"URL: {target_url}"
+    def _reset_buttons(self):
+        self.mic_btn.config(
+            text="🎙️  Click to Speak (กดเพื่อพูด)",
+            bg="#10b981",
+            activebackground="#059669",
+            state=tk.NORMAL,
+        )
+        self.cancel_btn.config(bg="#3f3f46", fg="#d4d4d8")
 
-                self.root.after(0, lambda: self.set_goal(f"{badge} {page_desc}\nGoal: {goal}"))
-                self.root.after(0, lambda: self.set_status(f"{badge} Executing on Chrome...", "#3b82f6"))
-                self.root.after(0, lambda: self.add_log(f"🎯 {badge} {goal}"))
+    def _on_step(self, step, state):
+        def update():
+            action = step.get("action", "")
+            kind = step.get("kind", "").upper()
+            prob = step.get("probability", 0.0)
+            text = step.get("text")
+            text_info = f" -> \"{text}\"" if text else ""
+            self.add_log(f"⚡ [{kind}] {action}{text_info} (p={prob:.2f})")
 
-            def on_step(step, state):
-                action = step.get("action", "")
-                kind = step.get("kind", "").upper()
-                prob = step.get("probability", 0.0)
-                text = step.get("text")
-                text_info = f" -> \"{text}\"" if text else ""
-                log_line = f"⚡ [{kind}] {action}{text_info} (p={prob:.2f})"
-                self.root.after(0, lambda: self.add_log(log_line))
+        self.root.after(0, update)
 
-            t0 = time.perf_counter()
-            snapshot = self.session.process_command(
-                user_text,
-                on_intent=on_intent,
-                on_step=on_step,
-            )
-            exec_sec = round(time.perf_counter() - t0, 1)
-
-            status = snapshot.get("status", "done").upper()
-            total_steps = len(snapshot.get("history", []))
-
-            self.root.after(0, lambda: self.add_log(f"✅ Finished: {status} in {exec_sec}s ({total_steps} steps)"))
-            self.root.after(0, lambda: self.set_status(f"Done! ({status}) — Click mic to speak again", "#10b981"))
-
-        except Exception as e:
-            err_msg = str(e)
-            if "remote-debugging" in err_msg or "DevToolsActivePort" in err_msg or "didn't come up" in err_msg:
-                self.root.after(0, lambda: self.add_log("⚠️ Chrome remote debugging not allowed!"))
-                self.root.after(0, lambda: self.add_log("👉 Open chrome://inspect/#remote-debugging in Chrome"))
-                self.root.after(0, lambda: self.set_status("Chrome not connected. See log.", "#ef4444"))
-            else:
-                self.root.after(0, lambda: self.add_log(f"❌ Error: {err_msg[:60]}..."))
-                self.root.after(0, lambda: self.set_status(f"Error: {err_msg[:30]}", "#ef4444"))
-        finally:
-            self.is_busy = False
+    def _on_close(self):
+        self.controller.shutdown(timeout=2.0)
+        self.root.destroy()
 
 
 def main():
@@ -345,3 +369,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

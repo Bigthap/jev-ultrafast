@@ -20,13 +20,24 @@ class Agent:
         activate=False,
         keep_open=False,
         reuse_tab=True,
+        target_id=None,
+        navigate_on_attach=True,
     ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
         plan = [task]
         self.pending_text = None
-        self.browser = Browser(url, activate=activate, keep_open=keep_open, reuse_tab=reuse_tab)
+        self.browser = Browser(
+            url,
+            activate=activate,
+            keep_open=keep_open,
+            reuse_tab=reuse_tab,
+            target_id=target_id,
+            navigate_on_attach=navigate_on_attach,
+        )
+        self.session_text_calls = []
+        self.session_elapsed_ms = 0
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
         try:
@@ -185,6 +196,11 @@ class Agent:
         self.state["decision"] = None
         self.state["history"] = []
         self.state["decisions"] = []
+        if hasattr(self, "session_text_calls"):
+            self.session_text_calls.extend(self.state.get("text_calls", []))
+            self.session_elapsed_ms += self.state.get("elapsed_ms", 0)
+        self.state["text_calls"] = []
+        self.state["elapsed_ms"] = 0
         self.pending_text = None
         self.state["page"] = self.browser.observe(screenshot=self.screenshots)
         self.state["started_at"] = time.perf_counter()
