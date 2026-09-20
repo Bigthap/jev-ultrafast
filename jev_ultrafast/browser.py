@@ -5,12 +5,13 @@ import json
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from browser_harness.admin import ensure_daemon
 from browser_harness.helpers import cdp
 
 # Atomically read visible content and controls, preserving actual DOM node identity.
-READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
+READ_STATE = Path(__file__).with_name("snapshot.js").read_text(encoding="utf-8")
 MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
 
 class StalePage(ValueError):
@@ -18,19 +19,77 @@ class StalePage(ValueError):
 
 
 class Browser:
-    def __init__(self, url):
+    def __init__(self, url, activate=False, keep_open=False, reuse_tab=True):
         ensure_daemon()
-        self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+        self.keep_open = keep_open
+        self.target = None
+
+        matched_existing = False
+        if reuse_tab:
+            try:
+                targets = cdp("Target.getTargets").get("targetInfos", [])
+                page_targets = [t for t in targets if t.get("type") == "page"]
+                domain = urlparse(url).netloc.lower()
+                if domain.startswith("www."):
+                    domain = domain[4:]
+                if domain:
+                    matched = next((t for t in page_targets if domain in t.get("url", "").lower()), None)
+                    if matched:
+                        self.target = matched["targetId"]
+                        matched_existing = True
+                if not self.target:
+                    empty_tab = next(
+                        (t for t in page_targets if t.get("url") in ("about:blank", "chrome://newtab/")),
+                        None,
+                    )
+                    if empty_tab:
+                        self.target = empty_tab["targetId"]
+            except Exception:
+                pass
+
+        if not self.target:
+            self.target = cdp("Target.createTarget", url="about:blank", background=not activate)["targetId"]
+
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
-        self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
-        # Keep rAF/menus rendering in an owned background tab, without activating the user's Chrome tab.
+        if activate:
+            self.activate_tab()
+        else:
+            self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
+
         self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+        if url:
+            if not matched_existing:
+                self.navigate(url)
+            else:
+                curr = self.get_current_info()
+                curr_url = curr.get("url", "") if curr else ""
+                parsed = urlparse(url)
+                if parsed.path not in ("", "/") or domain not in curr_url.lower():
+                    self.navigate(url)
+
+    def activate_tab(self):
+        try:
+            cdp("Target.activateTarget", targetId=self.target)
+            self.call("Page.bringToFront")
+        except Exception:
+            pass
+
+    def navigate(self, url):
         self.call("Page.navigate", url=url)
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             if self.evaluate("document.readyState") == "complete":
                 break
             time.sleep(0.02)
+
+    def get_current_info(self):
+        try:
+            return {
+                "url": self.evaluate("window.location.href"),
+                "title": self.evaluate("document.title"),
+            }
+        except Exception:
+            return None
 
     def call(self, method, **params):
         return cdp(method, session_id=self.session, **params)
@@ -107,8 +166,11 @@ class Browser:
         return result
 
     def close(self):
-        if self.target:
-            cdp("Target.closeTarget", targetId=self.target)
+        if self.target and not self.keep_open:
+            try:
+                cdp("Target.closeTarget", targetId=self.target)
+            except Exception:
+                pass
             self.target = None
 
 

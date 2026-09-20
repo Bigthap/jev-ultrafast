@@ -5,10 +5,20 @@ description = "A browser agent that chooses instead of generating."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
-dependencies = ["browser-harness==0.1.13", "httpx[http2]>=0.28,<1"]
+dependencies = [
+    "browser-harness==0.1.13",
+    "httpx[http2]>=0.28,<1",
+    "numpy>=2.5.3",
+    "pynput>=1.8.2",
+    "scipy>=1.18.1",
+    "sounddevice>=0.5.6",
+    "speechrecognition>=3.17.0",
+]
 
 [project.scripts]
 jev = "jev_ultrafast.demo:main"
+jev-voice = "jev_ultrafast.voice_listener:main"
+jev-gui = "jev_ultrafast.voice_gui:main"
 
 [build-system]
 requires = ["hatchling"]

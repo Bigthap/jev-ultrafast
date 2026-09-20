@@ -10,13 +10,23 @@ from .questions import MAX_STEPS
 
 
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False):
+    def __init__(
+        self,
+        url,
+        goals,
+        *,
+        record_dir=None,
+        screenshots=False,
+        activate=False,
+        keep_open=False,
+        reuse_tab=True,
+    ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
         plan = [task]
         self.pending_text = None
-        self.browser = Browser(url)
+        self.browser = Browser(url, activate=activate, keep_open=keep_open, reuse_tab=reuse_tab)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
         try:
@@ -163,6 +173,29 @@ class Agent:
     def run(self):
         while self.state["status"] not in {"done", "blocked"}:
             yield self.command("tick")
+
+    def set_goal(self, goal):
+        task = goal.strip() if isinstance(goal, str) else "\n".join(goal).strip()
+        if not task:
+            raise ValueError("Supply a task")
+        self.state["goal"] = task
+        self.state["plan"] = [task]
+        self.state["plan_index"] = 0
+        self.state["status"] = "ready"
+        self.state["decision"] = None
+        self.state["history"] = []
+        self.state["decisions"] = []
+        self.pending_text = None
+        self.state["page"] = self.browser.observe(screenshot=self.screenshots)
+        self.state["started_at"] = time.perf_counter()
+
+    def navigate_to(self, url, goal=None):
+        self.browser.navigate(url)
+        self.browser.activate_tab()
+        if goal:
+            self.set_goal(goal)
+        else:
+            self.state["page"] = self.browser.observe(screenshot=self.screenshots)
 
     def close(self):
         self.browser.close()
